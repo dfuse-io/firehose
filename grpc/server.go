@@ -3,7 +3,10 @@ package grpc
 import (
 	"context"
 	"fmt"
+	pbcodec "github.com/dfuse-io/dfuse-eosio/pb/dfuse/eosio/codec/v1"
+	"github.com/golang/protobuf/ptypes"
 	"strings"
+	"time"
 
 	"github.com/dfuse-io/bstream"
 	blockstream "github.com/dfuse-io/bstream/blockstream/v2"
@@ -34,6 +37,7 @@ func NewServer(
 	liveHeadTracker bstream.BlockRefGetter,
 	tracker *bstream.Tracker,
 	trimmer blockstream.BlockTrimmer,
+	rateLimit int,
 ) *Server {
 	liveSupport := liveSourceFactory != nil && liveHeadTracker != nil
 	logger.Info("setting up blockstream server (v2)", zap.Bool("live_support", liveSupport))
@@ -59,14 +63,32 @@ func NewServer(
 	})
 
 	blockStreamService.SetPostHook(func(ctx context.Context, response *pbbstream.BlockResponseV2) {
-		//////////////////////////////////////////////////////////////////////
-		dmetering.EmitWithContext(dmetering.Event{
-			Source:      "firehose",
-			Kind:        "gRPC Stream",
-			Method:      "Blocks",
-			EgressBytes: int64(response.XXX_Size()),
-		}, ctx)
-		//////////////////////////////////////////////////////////////////////
+
+		block := &pbcodec.Block{}
+		err := ptypes.UnmarshalAny(response.Block, block)
+
+		if err != nil {
+			logger.Warn("failed to unmarshal block", zap.Error(err))
+		} else {
+
+			blockTime, err := block.Time()
+
+			// we slow down throughput if the allowed doc quota is not unlimited ("0") and unless it's live blocks (< 5 min)
+			if err == nil && time.Since(blockTime) > 5*time.Minute && rateLimit > 0 {
+				sleep := time.Duration(1000/rateLimit) * time.Millisecond
+				time.Sleep(sleep)
+			}
+
+			//////////////////////////////////////////////////////////////////////
+			dmetering.EmitWithContext(dmetering.Event{
+				Source:         "firehose",
+				Kind:           "gRPC Stream",
+				Method:         "Blocks",
+				EgressBytes:    int64(response.XXX_Size()),
+				ResponsesCount: 1,
+			}, ctx)
+			//////////////////////////////////////////////////////////////////////
+		}
 	})
 
 	options := []dgrpc.ServerOption{
